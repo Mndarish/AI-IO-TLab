@@ -1,0 +1,32 @@
+#PBS -S /bin/bash
+#PBS -q auto_free
+#PBS -j oe
+#PBS -N aiio_ekf
+#PBS -l walltime=12:00:00
+#PBS -l select=1:ncpus=36:mem=250gb:ngpus=1
+
+# Step 3 of 3 (optional, one job per split): horizon metrics through the Air-IO EKF.
+# The EKF is CPU-bound (~170 s per 25 s segment on one core), so the segments are
+# spread over the allocated cores.
+#   qsub -v AIIO_EXP=exp1_sepoct_20pct aiio_ekf.pbs
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load apptainer/1.4.1
+source ./aiio_env.sh
+
+EXP="${AIIO_EXP:?set AIIO_EXP, e.g. qsub -v AIIO_EXP=exp0_july_only aiio_ekf.pbs}"
+CONFIG="${AIIO_CONFIG:-configs/AIIO/finetune_aiio_${EXP}.conf}"
+WORKERS="${AIIO_EKF_WORKERS:-34}"
+STRIDE="${AIIO_EKF_STRIDE:-25}"
+MAXF=""; [ -n "${AIIO_EKF_MAX_FLIGHTS:-}" ] && MAXF="--max_flights ${AIIO_EKF_MAX_FLIGHTS}"
+
+[ -f "experiments/aiio_oct/finetune_aiio_${EXP}/ckpt/best_model.ckpt" ] || { echo "No fine-tuned checkpoint for $EXP yet"; exit 1; }
+echo "Compute node: $(hostname)   workers=$WORKERS stride=${STRIDE}s"
+check_wandb
+
+WB=""; [ -z "$LOGFLAG" ] && WB="--wandb_project ${AIIO_WANDB_HORIZON_PROJECT:-AIIO_horizons}"
+run_gpu python3 -u tools/eval_horizons.py \
+    --config "$CONFIG" --tag "$EXP" --which eval \
+    --stride "$STRIDE" --workers "$WORKERS" --device cuda:0 $MAXF $WB
+
+echo "AI-IO EKF horizon evaluation finished: $EXP"

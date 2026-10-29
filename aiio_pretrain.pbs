@@ -1,0 +1,36 @@
+#PBS -S /bin/bash
+#PBS -q auto_free
+#PBS -j oe
+#PBS -N aiio_pretrain
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=36:mem=250gb:ngpus=1
+
+# Step 1 of 3: pre-train the AI-IO network on EuRoC (there is no public EuRoC
+# checkpoint for it, unlike AirIO). Same recipe as AirIO's EuRoC config.
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load apptainer/1.4.1
+source ./aiio_env.sh
+
+CONFIG=configs/EuRoC/aiio_tf.conf
+CKPT=experiments/aiio_euroc/aiio_tf/ckpt/best_model.ckpt
+[ -f "$CONFIG" ] || { echo "Missing $CONFIG: run ./setup_aiio.sh first"; exit 1; }
+
+echo "Working directory: $(pwd)"
+echo "Compute node: $(hostname)"
+echo "Config: $CONFIG"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+check_wandb
+
+echo "Self-test"
+run python3 tools/selftest_aiio.py
+
+echo "Pre-training AI-IO on EuRoC (resumes from newest.ckpt if present)"
+run_gpu python3 -u train_motion.py \
+    --config "$CONFIG" \
+    --load_ckpt \
+    --device cuda:0 \
+    $LOGFLAG
+
+[ -f "$CKPT" ] || { echo "Expected checkpoint not found: $CKPT"; exit 1; }
+echo "AI-IO EuRoC pre-training finished: $CKPT"

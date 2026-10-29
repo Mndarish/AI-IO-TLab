@@ -1,0 +1,68 @@
+#PBS -S /bin/bash
+#PBS -q auto_free
+#PBS -j oe
+#PBS -N aiio_exp
+#PBS -l walltime=24:00:00
+#PBS -l select=1:ncpus=36:mem=250gb:ngpus=1
+
+# Step 2 of 3 (one job per split): fine-tune AI-IO from the EuRoC checkpoint with
+# the same adaptive-loss recipe, GMM sampling and flight lists as the AirIO runs,
+# then run inference and the standard Air-IO metrics.
+#   qsub -v AIIO_EXP=exp1_sepoct_20pct aiio_exp.pbs
+set -euo pipefail
+cd "$PBS_O_WORKDIR"
+module load apptainer/1.4.1
+source ./aiio_env.sh
+
+EXP="${AIIO_EXP:?set AIIO_EXP, e.g. qsub -v AIIO_EXP=exp0_july_only aiio_exp.pbs}"
+CONFIG="${AIIO_CONFIG:-configs/AIIO/finetune_aiio_${EXP}.conf}"
+DATACONF="${AIIO_DATACONF:-configs/datasets/AIIO/tlab_body_aiio_${EXP}.conf}"
+PRETRAINED="${AIIO_CHECKPOINT:-experiments/aiio_euroc/aiio_tf/ckpt/best_model.ckpt}"
+SEQLEN="${AIIO_SEQLEN:-200}"
+EXPERIMENT="experiments/aiio_oct/finetune_aiio_${EXP}"
+
+[ -f "$CONFIG" ]     || { echo "Missing $CONFIG: run ./setup_aiio.sh first"; exit 1; }
+[ -f "$PRETRAINED" ] || { echo "Missing EuRoC checkpoint $PRETRAINED: run aiio_pretrain.pbs first"; exit 1; }
+
+echo "Working directory: $(pwd)"
+echo "Compute node: $(hostname)"
+echo "Experiment: $EXP   Config: $CONFIG"
+echo "Pretrained checkpoint: $PRETRAINED"
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+check_wandb
+
+echo "Validating GMM sampling cache"
+run python3 -u build_gmm_weights.py --config "$CONFIG" --plot none --if-stale
+
+echo "Fine-tuning AI-IO (resumes from newest.ckpt if present)"
+run_gpu python3 -u train_motion_finetune.py \
+    --config "$CONFIG" \
+    --pretrained_ckpt "$PRETRAINED" \
+    --load_ckpt \
+    --device cuda:0 \
+    $LOGFLAG
+
+echo "Saving reference orientations"
+run python3 evaluation/save_ori.py \
+    --dataconf "$DATACONF" \
+    --savedir "./orientations/aiio_${EXP}" \
+    --device cpu
+
+echo "Windowed AI-IO inference over every flight"
+run_gpu python3 -u tools/aiio_inference.py --config "$CONFIG" --device cuda:0
+
+echo "Standard Air-IO metrics (ATE / velocity RMSE / RTE per flight)"
+run python3 evaluation/evaluate_motion.py \
+    --dataconf "$DATACONF" \
+    --exp "$EXPERIMENT" \
+    --savedir "./result/aiio_${EXP}" \
+    --csvdir "results_csv/aiio_${EXP}" \
+    --seqlen "$SEQLEN"
+
+echo "Horizon metrics (9/12/25 s), net-only, held-out eval flights"
+WB=""; [ -z "$LOGFLAG" ] && WB="--wandb_project ${AIIO_WANDB_HORIZON_PROJECT:-AIIO_horizons}"
+run_gpu python3 -u tools/eval_horizons.py \
+    --config "$CONFIG" --tag "$EXP" --which eval --skip_ekf --stride 12.5 \
+    --device cuda:0 $WB
+
+echo "AI-IO split finished: $EXP"
